@@ -1,0 +1,55 @@
+# TMAS Official Override File
+# Docs: https://docs.trendmicro.com/en-us/documentation/article/trend-vision-one-override-vulnerability-findings
+#
+# Usage: tmas scan docker:IMAGE -VMS --override tmas_overrides.yml
+#
+# Overridden findings move to "Overridden" section in JSON output (audit trail preserved)
+
+vulnerabilities:
+  # --- Kernel packages (irrelevant in containers - containers use host kernel) ---
+  - rule:
+      package:
+        name: linux-libc-dev
+    reason: "Kernel dev headers - containers use host kernel, not base image kernel"
+
+  - rule:
+      package:
+        name: linux-headers-*
+    reason: "Kernel headers - not used at container runtime"
+
+  # --- Distro packages commonly flagged but not runtime-relevant ---
+  - rule:
+      package:
+        name: passwd
+    reason: "Shadow utils - not relevant in immutable container"
+
+  - rule:
+      package:
+        name: login
+    reason: "Login utils - no interactive login in container"
+
+  # --- Unfixed vulns with no available patch ---
+  # Uncomment to exclude all not-fixed vulns (aggressive, use with caution):
+  # - rule:
+  #     fixState: not-fixed
+  #   reason: "No patch available - tracked separately"
+
+  # --- Specific CVEs (add as you triage) ---
+  # - rule:
+  #     vulnerability: CVE-2024-XXXXX
+  #   reason: "Disputed - not exploitable in this context"
+
+secrets:
+  # Exclude test fixtures and third-party deps
+  paths:
+    - patterns:
+        - node_modules
+        - vendor
+        - ".*_test\\."
+        - ".*\\.test\\."
+        - test-fixtures
+      reason: "Third party dependencies and test files"
+  rules:
+    - patterns:
+        - generic-api-key
+      reason: "High false positive rate"

@@ -1,54 +1,118 @@
 # tmas-test
 
-TMAS (Trend Micro Artifact Scanner) CI integration with enriched metadata collection.
+TMAS (Trend Micro Artifact Scanner) CI integration with enriched metadata and K8s labels.
 
 ## What This Does
 
-Runs TMAS container image scanning in GitHub Actions CI, enriched with:
+Runs TMAS container image scanning in GitHub Actions CI using the [official tmas-scan-action](https://github.com/trendmicro/tmas-scan-action), enriched with:
 
-- **App metadata**: git SHA, branch, build URL, image digest/size/OS/arch
-- **Docker image labels**: OCI annotations, maintainer, version
+- **Official `--override`**: Exclude irrelevant findings (kernel vulns, not-fixed, false positives)
+- **Official `--evaluatePolicy`**: Check against V1 Code Security policies
+- **App metadata**: git SHA, branch, build URL, image digest/size/OS/arch, docker labels
 - **Kubernetes labels**: parsed from deployment manifests in the repo
-- **Live cluster labels**: optional query against running K8s cluster
 - **SBOM**: Software Bill of Materials export
 
 ## Quick Start
 
 1. Add your V1 API key as a GitHub secret: `TMAS_API_KEY`
-2. Push a Dockerfile — the workflow scans on every push/PR
-3. Results appear as workflow artifacts + PR comments
+2. Edit `tmas_overrides.yml` to exclude irrelevant detections
+3. Push — the workflow scans on every push/PR
+
+## Excluding Irrelevant Detections
+
+TMAS has **official override support** via `--override tmas_overrides.yml`.
+
+Overridden findings move to an `"Overridden"` section in JSON output (audit trail preserved, not deleted).
+
+### Override by package name (e.g., kernel packages)
+
+```yaml
+vulnerabilities:
+  - rule:
+      package:
+        name: linux-libc-dev
+    reason: "Kernel headers - containers use host kernel"
+```
+
+### Override by CVE
+
+```yaml
+vulnerabilities:
+  - rule:
+      vulnerability: CVE-2024-1234
+    reason: "Not exploitable in container context"
+```
+
+### Override by fix state
+
+```yaml
+vulnerabilities:
+  - rule:
+      fixState: not-fixed
+      package:
+        name: libcurl
+    reason: "No fix available, mitigated by WAF"
+```
+
+### Override by package type + location (glob patterns)
+
+```yaml
+vulnerabilities:
+  - rule:
+      package:
+        type: deb
+        location: "/usr/share/doc/**"
+    reason: "Doc-only packages"
+```
+
+### Override secrets
+
+```yaml
+secrets:
+  paths:
+    - patterns:
+        - node_modules
+        - ".*_test\\."
+      reason: "Third party and test files"
+  rules:
+    - patterns:
+        - generic-api-key
+      reason: "High false positive rate"
+```
+
+Full docs: [Override vulnerability and secret findings](https://docs.trendmicro.com/en-us/documentation/article/trend-vision-one-override-vulnerability-findings)
+
+## V1 Code Security Policy Evaluation
+
+Use `--evaluatePolicy` to check scan results against centrally managed policies in V1 Console:
+
+```bash
+tmas scan docker:myapp:latest -VMS --evaluatePolicy
+```
+
+Exit code `2` = policy violated. Configure policies in V1 Console under Code Security.
 
 ## Local Usage
 
 ```bash
-# Scan image with K8s manifest enrichment
-./scripts/tmas-scan.sh myapp:latest k8s/
+# Scan with overrides
+tmas scan docker:myapp:latest -VMS --override tmas_overrides.yml
 
-# Scan image only (no K8s)
-./scripts/tmas-scan.sh myapp:latest
+# Scan + policy check
+tmas scan docker:myapp:latest -VMS --override tmas_overrides.yml --evaluatePolicy
 
-# Custom output dir
-TMAS_OUTPUT_DIR=./reports ./scripts/tmas-scan.sh myapp:latest k8s/
+# Save SBOM
+tmas scan docker:myapp:latest -VMS --saveSBOM
 ```
 
-## CI Environment Variables
+## Enriched Metadata
 
-The scanner auto-detects CI context from:
+The CI workflow also collects context not available from TMAS alone:
 
-| CI System | Detection | Variables Used |
-|-----------|-----------|----------------|
-| GitHub Actions | `GITHUB_ACTIONS` | `GITHUB_SHA`, `GITHUB_REF_NAME`, `GITHUB_RUN_ID`, `GITHUB_ACTOR` |
-| GitLab CI | `GITLAB_CI` | `CI_COMMIT_SHA`, `CI_COMMIT_BRANCH`, `CI_PIPELINE_URL` |
-| Jenkins | `JENKINS_URL` | `BUILD_URL`, `BUILD_NUMBER`, `GIT_COMMIT` |
+| Source | Metadata |
+|--------|----------|
+| Docker inspect | Image digest, size, OS/arch, layers, OCI labels, exposed ports |
+| K8s manifests | Deployment/pod labels, annotations, namespace, resource limits |
+| CI environment | Git SHA, branch, build URL, actor, run number |
 
-## Report Schema
-
-```json
-{
-  "scan_metadata": { "timestamp", "tmas_version", "image": { "name", "tag", "digest", "size_bytes", "os", "arch", "labels" } },
-  "ci_metadata": { "system", "build_url", "build_id", "triggered_by", "git": { "sha", "branch", "repo" } },
-  "kubernetes": { "from_manifests": [...], "from_live_cluster": [...] },
-  "summary": { "vulnerabilities", "critical", "high", "malware", "secrets", "pass" },
-  "scan_results": { /* raw tmas output */ }
-}
-```
+This helps answer "where does this vulnerable image actually run?" across multiple clusters.
