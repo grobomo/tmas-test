@@ -67,6 +67,19 @@ jobs:
             -o json > tmas-results/secret-scan.json 2>&1 || true
           echo "::endgroup::"
 
+      # Filter out irrelevant detections
+      - name: Filter scan results
+        run: |
+          pip install pyyaml -q
+          python3 scripts/filter-results.py \
+            tmas-results/vuln-scan.json \
+            tmas-exclusions.yaml \
+            --output tmas-results/filtered-vulns.json || true
+          python3 scripts/filter-results.py \
+            tmas-results/vuln-scan.json \
+            tmas-exclusions.yaml \
+            --summary || true
+
       # Collect enriched metadata
       - name: Collect App + K8s Metadata
         run: |
