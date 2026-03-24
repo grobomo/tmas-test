@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tmas-test-app
+  namespace: default
+  labels:
+    app: tmas-test
+    app.kubernetes.io/name: tmas-test
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: tmas-demo
+    app.kubernetes.io/managed-by: github-actions
+    team: platform
+    env: staging
+    cost-center: engineering
+    data-classification: internal
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: tmas-test
+  template:
+    metadata:
+      labels:
+        app: tmas-test
+        app.kubernetes.io/name: tmas-test
+        app.kubernetes.io/version: "1.0.0"
+        app.kubernetes.io/component: api
+        team: platform
+      annotations:
+        tmas.trendmicro.com/last-scan: ""
+        tmas.trendmicro.com/scan-result: ""
+    spec:
+      containers:
+        - name: app
+          image: ghcr.io/grobomo/tmas-test:latest
+          ports:
+            - containerPort: 8080
+          resources:
+            limits:
+              memory: "128Mi"
+              cpu: "250m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5

@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: tmas-test-app
+  namespace: default
+  labels:
+    app: tmas-test
+    app.kubernetes.io/name: tmas-test
+spec:
+  selector:
+    app: tmas-test
+  ports:
+    - port: 80
+      targetPort: 8080
+  type: ClusterIP

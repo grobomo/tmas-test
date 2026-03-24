@@ -1,0 +1,274 @@
+name: TMAS Container Scan
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  build-and-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build the container image
+      - name: Build image
+        run: |
+          docker build -t ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} .
+          docker tag ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} ${{ env.IMAGE_NAME }}:latest
+
+      # Install TMAS CLI
+      - name: Install TMAS
+        run: |
+          # Install Trend Micro Artifact Scanner
+          curl -sSL https://cli.artifactscan.cloudone.trendmicro.com/tmas-cli/latest/tmas-cli_Linux_x86_64.tar.gz -o tmas.tar.gz
+          tar xzf tmas.tar.gz
+          sudo mv tmas /usr/local/bin/
+          tmas version
+
+      # Run TMAS scan with enriched metadata
+      - name: TMAS Scan (vulnerabilities + malware + secrets)
+        id: tmas
+        continue-on-error: true
+        env:
+          TMAS_API_KEY: ${{ secrets.TMAS_API_KEY }}
+          TMAS_OUTPUT_DIR: ./tmas-results
+        run: |
+          mkdir -p tmas-results
+
+          # --- Run TMAS scans ---
+          echo "::group::Vulnerability Scan"
+          tmas scan "docker:${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" \
+            --saveSBOM tmas-results/sbom.json \
+            -o json > tmas-results/vuln-scan.json 2>&1 || true
+          cat tmas-results/vuln-scan.json | python3 -m json.tool 2>/dev/null || true
+          echo "::endgroup::"
+
+          echo "::group::Malware Scan"
+          tmas scan "docker:${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" \
+            --malwareScan \
+            -o json > tmas-results/malware-scan.json 2>&1 || true
+          echo "::endgroup::"
+
+          echo "::group::Secret Scan"
+          tmas scan "docker:${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" \
+            --secretScan \
+            -o json > tmas-results/secret-scan.json 2>&1 || true
+          echo "::endgroup::"
+
+      # Collect enriched metadata
+      - name: Collect App + K8s Metadata
+        run: |
+          python3 << 'PYEOF'
+          import json, yaml, glob, os, subprocess
+
+          report = {
+              "scan_metadata": {
+                  "timestamp": "${{ github.event.head_commit.timestamp }}",
+                  "image": {
+                      "full": "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}",
+                      "name": "${{ env.IMAGE_NAME }}",
+                      "tag": "${{ env.IMAGE_TAG }}"
+                  }
+              },
+              "ci_metadata": {
+                  "system": "github-actions",
+                  "build_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+                  "build_id": "${{ github.run_id }}",
+                  "run_number": "${{ github.run_number }}",
+                  "triggered_by": "${{ github.actor }}",
+                  "event": "${{ github.event_name }}",
+                  "git": {
+                      "sha": "${{ github.sha }}",
+                      "branch": "${{ github.ref_name }}",
+                      "repo": "${{ github.repository }}"
+                  }
+              },
+              "kubernetes": {
+                  "from_manifests": []
+              },
+              "scan_results": {},
+              "summary": {}
+          }
+
+          # Collect image metadata from docker inspect
+          try:
+              inspect = json.loads(subprocess.check_output(
+                  ["docker", "inspect", "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"],
+                  text=True
+              ))
+              img = inspect[0] if inspect else {}
+              report["scan_metadata"]["image"].update({
+                  "digest": (img.get("RepoDigests", [""])[0].split("@")[-1] if img.get("RepoDigests") else ""),
+                  "created": img.get("Created", ""),
+                  "size_bytes": img.get("Size", 0),
+                  "os": img.get("Os", ""),
+                  "arch": img.get("Architecture", ""),
+                  "docker_labels": img.get("Config", {}).get("Labels", {}),
+                  "env_vars": [e.split("=")[0] for e in img.get("Config", {}).get("Env", [])],
+                  "exposed_ports": list(img.get("Config", {}).get("ExposedPorts", {}).keys()),
+                  "layers": len(img.get("RootFS", {}).get("Layers", []))
+              })
+          except Exception as e:
+              report["scan_metadata"]["image"]["inspect_error"] = str(e)
+
+          # Parse K8s manifests for labels
+          for f in glob.glob("k8s/**/*.yaml", recursive=True) + glob.glob("k8s/**/*.yml", recursive=True):
+              try:
+                  with open(f) as fh:
+                      for doc in yaml.safe_load_all(fh):
+                          if not doc or not isinstance(doc, dict):
+                              continue
+                          kind = doc.get("kind", "")
+                          if kind in ("Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob", "Pod"):
+                              meta = doc.get("metadata", {})
+                              tmpl = doc.get("spec", {}).get("template", {})
+                              containers = tmpl.get("spec", {}).get("containers", [])
+                              report["kubernetes"]["from_manifests"].append({
+                                  "source": f,
+                                  "kind": kind,
+                                  "name": meta.get("name", ""),
+                                  "namespace": meta.get("namespace", "default"),
+                                  "labels": meta.get("labels", {}),
+                                  "pod_labels": tmpl.get("metadata", {}).get("labels", {}),
+                                  "annotations": meta.get("annotations", {}),
+                                  "pod_annotations": tmpl.get("metadata", {}).get("annotations", {}),
+                                  "images": [c.get("image", "") for c in containers],
+                                  "container_names": [c.get("name", "") for c in containers],
+                                  "resource_limits": {c.get("name"): c.get("resources", {}) for c in containers}
+                              })
+              except Exception:
+                  pass
+
+          # Load scan results
+          for scan_type in ["vuln-scan", "malware-scan", "secret-scan"]:
+              path = f"tmas-results/{scan_type}.json"
+              if os.path.exists(path):
+                  try:
+                      with open(path) as f:
+                          report["scan_results"][scan_type.replace("-", "_")] = json.load(f)
+                  except Exception:
+                      pass
+
+          # Build summary
+          vulns = report["scan_results"].get("vuln_scan", {})
+          vuln_list = vulns.get("vulnerabilities", [])
+          if isinstance(vuln_list, list):
+              report["summary"] = {
+                  "total_vulnerabilities": len(vuln_list),
+                  "critical": len([v for v in vuln_list if v.get("severity", "").lower() == "critical"]),
+                  "high": len([v for v in vuln_list if v.get("severity", "").lower() == "high"]),
+                  "medium": len([v for v in vuln_list if v.get("severity", "").lower() == "medium"]),
+                  "low": len([v for v in vuln_list if v.get("severity", "").lower() == "low"]),
+                  "malware_findings": len(report["scan_results"].get("malware_scan", {}).get("malware", [])),
+                  "secret_findings": len(report["scan_results"].get("secret_scan", {}).get("secrets", [])),
+                  "pass": len(vuln_list) == 0
+              }
+
+          with open("tmas-results/enriched-report.json", "w") as f:
+              json.dump(report, f, indent=2)
+
+          # Print summary
+          print("\n=== TMAS Enriched Scan Summary ===")
+          print(f"Image: {report['scan_metadata']['image']['full']}")
+          print(f"Labels (docker): {json.dumps(report['scan_metadata']['image'].get('docker_labels', {}), indent=2)}")
+          k8s = report['kubernetes']['from_manifests']
+          if k8s:
+              print(f"\nK8s Workloads ({len(k8s)}):")
+              for w in k8s:
+                  print(f"  {w['kind']}/{w['name']} (ns: {w['namespace']})")
+                  print(f"    labels: {json.dumps(w['labels'])}")
+                  print(f"    pod_labels: {json.dumps(w['pod_labels'])}")
+          print(f"\nFindings: {json.dumps(report.get('summary', {}), indent=2)}")
+          PYEOF
+
+      # Post results as PR comment
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let report = {};
+            try {
+              report = JSON.parse(fs.readFileSync('tmas-results/enriched-report.json', 'utf8'));
+            } catch(e) {
+              report = { summary: { error: 'Failed to parse report' } };
+            }
+
+            const s = report.summary || {};
+            const img = report.scan_metadata?.image || {};
+            const k8s = report.kubernetes?.from_manifests || [];
+            const labels = img.docker_labels || {};
+
+            let body = `## TMAS Scan Results\n\n`;
+            body += `**Image:** \`${img.full || 'unknown'}\`\n`;
+            body += `**Layers:** ${img.layers || '?'} | **Size:** ${Math.round((img.size_bytes || 0) / 1048576)}MB | **OS/Arch:** ${img.os || '?'}/${img.arch || '?'}\n\n`;
+
+            // Docker labels
+            if (Object.keys(labels).length > 0) {
+              body += `### Docker Labels\n| Key | Value |\n|-----|-------|\n`;
+              for (const [k, v] of Object.entries(labels)) {
+                body += `| \`${k}\` | ${v} |\n`;
+              }
+              body += `\n`;
+            }
+
+            // K8s labels
+            if (k8s.length > 0) {
+              body += `### Kubernetes Labels\n`;
+              for (const w of k8s) {
+                body += `**${w.kind}/${w.name}** (ns: ${w.namespace})\n`;
+                body += `| Label | Value |\n|-------|-------|\n`;
+                for (const [k, v] of Object.entries(w.labels || {})) {
+                  body += `| \`${k}\` | ${v} |\n`;
+                }
+                body += `\n`;
+              }
+            }
+
+            // Findings
+            body += `### Findings\n`;
+            body += `| Type | Count |\n|------|-------|\n`;
+            body += `| Vulnerabilities (Critical) | ${s.critical || 0} |\n`;
+            body += `| Vulnerabilities (High) | ${s.high || 0} |\n`;
+            body += `| Vulnerabilities (Medium) | ${s.medium || 0} |\n`;
+            body += `| Vulnerabilities (Low) | ${s.low || 0} |\n`;
+            body += `| Malware | ${s.malware_findings || 0} |\n`;
+            body += `| Secrets | ${s.secret_findings || 0} |\n\n`;
+            body += s.pass === false ? `❌ **FAILED** — findings detected\n` : `✅ **PASSED** — no findings\n`;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body
+            });
+
+      # Upload artifacts
+      - name: Upload scan results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tmas-scan-results
+          path: tmas-results/
+          retention-days: 30
+
+      # Fail if findings
+      - name: Check results
+        run: |
+          if [ "${{ steps.tmas.outcome }}" = "failure" ]; then
+            echo "::error::TMAS scan found issues — check the enriched report in artifacts"
+            exit 1
+          fi

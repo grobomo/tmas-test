@@ -1,0 +1,4 @@
+tmas-results/
+*.tar.gz
+__pycache__/
+.env
